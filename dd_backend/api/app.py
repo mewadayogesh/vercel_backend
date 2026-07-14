@@ -5,7 +5,8 @@ from flask_cors import CORS
 from collections import Counter
 
 # 1. Use relative import because models.py is in the same folder as app.py
-from models import db, DDEntry 
+#from models import db, DDEntry 
+from .models import db, DDEntry
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})

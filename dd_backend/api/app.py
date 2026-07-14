@@ -6,8 +6,8 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from openpyxl import Workbook
 
-from models import db, DDEntry  # absolute import — relative "from .models"
-                                 # only works inside a real package, and
+#from models import db, DDEntry  # absolute import — relative "from .models"
+from .models import db, DDEntry  # only works inside a real package, and
                                  # breaks when Render runs `gunicorn app:app`
 
 

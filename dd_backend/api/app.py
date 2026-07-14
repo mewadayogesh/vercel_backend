@@ -1,5 +1,5 @@
 import os
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 from collections import Counter
 from .models import db, DDEntry 
@@ -12,7 +12,6 @@ def create_app():
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
     db.init_app(app)
-
     with app.app_context():
         db.create_all()
 
@@ -33,11 +32,13 @@ def create_app():
     def get_all():
         return jsonify([entry_to_dict(e) for e in DDEntry.query.order_by(DDEntry.id.desc()).all()])
 
+    # Search Route
     @app.route('/api/entries/<global_id>', methods=['GET'])
     def search(global_id):
         entry = DDEntry.query.filter_by(Global=global_id).first()
         return jsonify(entry_to_dict(entry)) if entry else (jsonify({"error": "Not found"}), 404)
 
+    # Delete Route
     @app.route('/api/entries/<int:id>', methods=['DELETE'])
     def delete(id):
         entry = DDEntry.query.get_or_404(id)
@@ -47,22 +48,22 @@ def create_app():
 
     @app.route('/api/dashboard-stats', methods=['GET'])
     def stats():
-        entries = DDEntry.query.all()
-        dept_counts = Counter(e.department or 'Unspecified' for e in entries)
-        priority_counts = Counter(e.priority or 'Unspecified' for e in entries)
-        return jsonify({
-            "total_records": len(entries),
-            "dept_labels": list(dept_counts.keys()), "dept_values": list(dept_counts.values()),
-            "priority_labels": list(priority_counts.keys()), "priority_values": list(priority_counts.values())
-        })
-
-    @app.route('/')
-    def home():
-        return "API is active"
+        try:
+            entries = DDEntry.query.all()
+            dept_counts = Counter(e.department or 'Unspecified' for e in entries)
+            priority_counts = Counter(e.priority or 'Unspecified' for e in entries)
+            return jsonify({
+                "total_records": len(entries),
+                "dept_labels": list(dept_counts.keys()), "dept_values": list(dept_counts.values()),
+                "priority_labels": list(priority_counts.keys()), "priority_values": list(priority_counts.values())
+            })
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     return app
 
 app = create_app()
+
 # this code is working some function is running
 # import os
 # from flask import Flask, request, jsonify

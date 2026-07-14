@@ -1,109 +1,60 @@
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from collections import Counter
-# Import db and DDEntry relative to the current file
-# This assumes models.py is in the same 'api' folder, or 'api' is a package
 from .models import db, DDEntry 
 
 def create_app():
     app = Flask(__name__)
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-    # DATABASE CONFIGURATION
-    # Ensure DATABASE_URL is set in Render Environment Variables
     app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
     db.init_app(app)
 
-    # Initialize tables within the app context
     with app.app_context():
         db.create_all()
 
-    # Helper to convert DB objects to dictionary
-    def entry_to_dict(entry):
+    def entry_to_dict(e):
         return {
-            "id": entry.id,
-            "department": entry.department,
-            "workType": entry.work,
-            "date": entry.date,
-            "globalId": entry.Global,
-            "purpose": entry.purpose,
-            "material": entry.material,
-            "otherMaterial": entry.other_material,
-            "itemType": entry.item_type,
-            "otherType": entry.other_type,
-            "frequency": entry.frequency,
-            "quantity": entry.quantity,
-            "projectName": entry.project,
-            "description": entry.description,
-            "priority": entry.priority,
-            "status": entry.item,
-            "task": entry.task
+            "id": e.id, "department": e.department, "workType": e.work,
+            "date": e.date, "globalId": e.Global, "purpose": e.purpose,
+            "material": e.material, "otherMaterial": e.other_material,
+            "itemType": e.item_type, "otherType": e.other_type,
+            "frequency": e.frequency, "quantity": e.quantity,
+            "projectName": e.project, "description": e.description,
+            "priority": e.priority, "status": e.item, "task": e.task
         }
 
     # --- ROUTES ---
 
-    @app.route('/api/check-global-id/<global_id>', methods=['GET'])
-    def check_global_id(global_id):
-        exists = DDEntry.query.filter_by(Global=global_id).first() is not None
-        return jsonify({"exists": exists}), 200
-
-    @app.route('/api/entries', methods=['POST'])
-    def save():
-        data = request.json or {}
-        global_id = (data.get('global_id') or '').strip()
-        if global_id and DDEntry.query.filter_by(Global=global_id).first():
-            return jsonify({"success": False, "error": "Global ID already exists"}), 409
-        try:
-            new_entry = DDEntry(
-                department=data.get('department', ''),
-                work=data.get('work_type', ''),
-                date=data.get('date', ''),
-                Global=global_id,
-                purpose=data.get('purpose', ''),
-                material=data.get('material', ''),
-                other_material=data.get('material') if data.get('material') == 'Other' else "",
-                item_type=data.get('type', ''),
-                other_type=data.get('type') if data.get('type') == 'Other' else "",
-                frequency=data.get('frequency', ''),
-                quantity=str(data.get('quantity', '')),
-                project=data.get('project_name', ''),
-                description=data.get('description', ''),
-                priority=data.get('priority', ''),
-                item=data.get('item_status', ''),
-                task=data.get('task', '')
-            )
-            db.session.add(new_entry)
-            db.session.commit()
-            return jsonify({"success": True, "message": "Record saved!"}), 201
-        except Exception as e:
-            return jsonify({"success": False, "error": str(e)}), 500
-
     @app.route('/api/entries', methods=['GET'])
-    def get_all_records():
-        try:
-            entries = DDEntry.query.order_by(DDEntry.id.desc()).all()
-            return jsonify([entry_to_dict(e) for e in entries]), 200
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+    def get_all():
+        return jsonify([entry_to_dict(e) for e in DDEntry.query.order_by(DDEntry.id.desc()).all()])
+
+    @app.route('/api/entries/<global_id>', methods=['GET'])
+    def search(global_id):
+        entry = DDEntry.query.filter_by(Global=global_id).first()
+        return jsonify(entry_to_dict(entry)) if entry else (jsonify({"error": "Not found"}), 404)
+
+    @app.route('/api/entries/<int:id>', methods=['DELETE'])
+    def delete(id):
+        entry = DDEntry.query.get_or_404(id)
+        db.session.delete(entry)
+        db.session.commit()
+        return jsonify({"success": True}), 200
 
     @app.route('/api/dashboard-stats', methods=['GET'])
-    def dashboard_stats():
-        try:
-            entries = DDEntry.query.all()
-            dept_counts = Counter((e.department or 'Unspecified') for e in entries)
-            priority_counts = Counter((e.priority or 'Unspecified') for e in entries)
-            return jsonify({
-                "total_records": len(entries),
-                "dept_labels": list(dept_counts.keys()),
-                "dept_values": list(dept_counts.values()),
-                "priority_labels": list(priority_counts.keys()),
-                "priority_values": list(priority_counts.values()),
-            }), 200
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
+    def stats():
+        entries = DDEntry.query.all()
+        dept_counts = Counter(e.department or 'Unspecified' for e in entries)
+        priority_counts = Counter(e.priority or 'Unspecified' for e in entries)
+        return jsonify({
+            "total_records": len(entries),
+            "dept_labels": list(dept_counts.keys()), "dept_values": list(dept_counts.values()),
+            "priority_labels": list(priority_counts.keys()), "priority_values": list(priority_counts.values())
+        })
 
     @app.route('/')
     def home():
@@ -112,9 +63,6 @@ def create_app():
     return app
 
 app = create_app()
-
-if __name__ == '__main__':
-    app.run()
 # this code is working some function is running
 # import os
 # from flask import Flask, request, jsonify

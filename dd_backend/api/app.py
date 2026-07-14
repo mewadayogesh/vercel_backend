@@ -1,19 +1,37 @@
 import os
-from flask import Flask, request, jsonify
-from flask_cors import CORS
+import io
 from collections import Counter
-from .models import db, DDEntry 
+
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+from openpyxl import Workbook
+
+from models import db, DDEntry  # absolute import — relative "from .models"
+                                 # only works inside a real package, and
+                                 # breaks when Render runs `gunicorn app:app`
+
 
 def create_app():
     app = Flask(__name__)
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL')
-    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    database_url = os.environ.get('DATABASE_URL', 'sqlite:////tmp/project.db')
+    if database_url.startswith('postgres://'):
+        # SQLAlchemy 1.4+ requires the postgresql:// scheme
+        database_url = database_url.replace('postgres://', 'postgresql://', 1)
 
+    app.config['SQLALCHEMY_DATABASE_URI'] = database_url
+    app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     db.init_app(app)
+
     with app.app_context():
-        db.create_all()
+        try:
+            db.create_all()
+        except Exception as e:
+            print(f"WARNING: db.create_all() failed at startup: {e}")
+
+    def can_edit():
+        return True
 
     def entry_to_dict(e):
         return {
@@ -26,44 +44,251 @@ def create_app():
             "priority": e.priority, "status": e.item, "task": e.task
         }
 
-    # --- ROUTES ---
+    # ── Duplicate Global ID check — used by the "New Entry" form ───────────
+    @app.route('/api/check-global-id/<global_id>', methods=['GET'])
+    def check_global_id(global_id):
+        exists = DDEntry.query.filter_by(Global=global_id).first() is not None
+        return jsonify({"exists": exists}), 200
 
+    # ── Create ───────────────────────────────────────────────────────────
+    @app.route('/api/entries', methods=['POST'])
+    def create_entry():
+        if not can_edit():
+            return jsonify({"error": "Unauthorized access"}), 403
+
+        data = request.json or {}
+        work_type = data.get('work_type', '')
+        global_id = (data.get('global_id') or '').strip()
+
+        if global_id and DDEntry.query.filter_by(Global=global_id).first() is not None:
+            return jsonify({"success": False, "error": "Global ID already exists"}), 409
+
+        if work_type == "Mechanical Design Related":
+            material = item_type = frequency = quantity = other_material = other_type = ""
+            chosen_purpose = data.get('purpose', '')
+            chosen_priority = data.get('priority', '')
+        else:
+            material = data.get('material', '')
+            item_type = data.get('type', '')
+            frequency = data.get('frequency', '')
+            quantity = str(data.get('quantity', ''))
+            other_material = data.get('material', '') if data.get('material') == 'Other' else ""
+            other_type = data.get('type', '') if data.get('type') == 'Other' else ""
+            chosen_purpose = data.get('purpose', '')
+            chosen_priority = data.get('priority', '')
+
+        entry = DDEntry(
+            department=data.get('department', ''),
+            work=work_type,
+            date=data.get('date', ''),
+            Global=global_id,
+            purpose=chosen_purpose,
+            material=material,
+            other_material=other_material,
+            item_type=item_type,
+            other_type=other_type,
+            frequency=frequency,
+            quantity=quantity,
+            project=data.get('project_name', ''),
+            description=data.get('description', ''),
+            priority=chosen_priority,
+            item=data.get('item_status', ''),
+            task=data.get('task', '')
+        )
+
+        try:
+            db.session.add(entry)
+            db.session.commit()
+            return jsonify({"success": True, "message": "Record written successfully!"}), 201
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ── Read all ─────────────────────────────────────────────────────────
     @app.route('/api/entries', methods=['GET'])
-    def get_all():
-        return jsonify([entry_to_dict(e) for e in DDEntry.query.order_by(DDEntry.id.desc()).all()])
+    def get_all_records():
+        try:
+            entries = DDEntry.query.order_by(DDEntry.id.desc()).all()
+            return jsonify([entry_to_dict(e) for e in entries]), 200
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
 
-    # Search Route
-    @app.route('/api/entries/<global_id>', methods=['GET'])
-    def search(global_id):
-        entry = DDEntry.query.filter_by(Global=global_id).first()
-        return jsonify(entry_to_dict(entry)) if entry else (jsonify({"error": "Not found"}), 404)
+    # ── Read one BY DATABASE ID — used by the Edit screen ───────────────
+    # NOTE: this uses <int:entry_id> specifically so it never collides with
+    # the Global ID search route below, which takes a string.
+    @app.route('/api/entries/<int:entry_id>', methods=['GET'])
+    def get_entry(entry_id):
+        entry = db.session.get(DDEntry, entry_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Record not found"}), 404
+        return jsonify(entry_to_dict(entry)), 200
 
-    # Delete Route
-    @app.route('/api/entries/<int:id>', methods=['DELETE'])
-    def delete(id):
-        entry = DDEntry.query.get_or_404(id)
-        db.session.delete(entry)
-        db.session.commit()
-        return jsonify({"success": True}), 200
+    # ── Update ───────────────────────────────────────────────────────────
+    @app.route('/api/entries/<int:entry_id>', methods=['PUT'])
+    def update_entry(entry_id):
+        if not can_edit():
+            return jsonify({"error": "Unauthorized access"}), 403
 
+        entry = db.session.get(DDEntry, entry_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Record not found"}), 404
+
+        data = request.json or {}
+        work_type = data.get('work_type', '')
+        new_global_id = (data.get('global_id') or entry.Global or '').strip()
+
+        if new_global_id:
+            clash = DDEntry.query.filter(
+                DDEntry.Global == new_global_id,
+                DDEntry.id != entry_id
+            ).first()
+            if clash is not None:
+                return jsonify({"success": False, "error": "Global ID already exists"}), 409
+
+        if work_type == "Mechanical Design Related":
+            material = item_type = frequency = quantity = other_material = other_type = ""
+            chosen_purpose = data.get('purpose', '')
+            chosen_priority = data.get('priority', '')
+        else:
+            material = data.get('material', '')
+            item_type = data.get('type', '')
+            frequency = data.get('frequency', '')
+            quantity = str(data.get('quantity', ''))
+            other_material = data.get('material', '') if data.get('material') == 'Other' else ""
+            other_type = data.get('type', '') if data.get('type') == 'Other' else ""
+            chosen_purpose = data.get('purpose', '')
+            chosen_priority = data.get('priority', '')
+
+        try:
+            entry.department = data.get('department', entry.department)
+            entry.work = work_type or entry.work
+            entry.date = data.get('date', entry.date)
+            entry.Global = new_global_id
+            entry.purpose = chosen_purpose
+            entry.material = material
+            entry.other_material = other_material
+            entry.item_type = item_type
+            entry.other_type = other_type
+            entry.frequency = frequency
+            entry.quantity = quantity
+            entry.project = data.get('project_name', entry.project)
+            entry.description = data.get('description', entry.description)
+            entry.priority = chosen_priority
+            entry.item = data.get('item_status', entry.item)
+            entry.task = data.get('task', entry.task)
+
+            db.session.commit()
+            return jsonify({"success": True, "message": "Record updated successfully!"}), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ── Delete ───────────────────────────────────────────────────────────
+    @app.route('/api/entries/<int:entry_id>', methods=['DELETE'])
+    def delete_entry(entry_id):
+        if not can_edit():
+            return jsonify({"error": "Unauthorized access"}), 403
+
+        entry = db.session.get(DDEntry, entry_id)
+        if not entry:
+            return jsonify({"success": False, "error": "Record not found"}), 404
+
+        try:
+            db.session.delete(entry)
+            db.session.commit()
+            return jsonify({"success": True, "message": "Record deleted"}), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ── Search by Global ID (Master Tracker screen) ─────────────────────
+    # Deliberately a DIFFERENT path (/api/entries/search) so it can never
+    # collide with the /api/entries/<int:entry_id> routes above.
+    @app.route('/api/entries/search', methods=['GET'])
+    def search_entries():
+        global_id = request.args.get('global_id', '').strip()
+        if not global_id:
+            return jsonify({"success": False, "error": "global_id query param is required"}), 400
+
+        entries = DDEntry.query.filter(
+            DDEntry.Global.ilike(f"%{global_id}%")
+        ).order_by(DDEntry.id.desc()).all()
+        return jsonify([entry_to_dict(e) for e in entries]), 200
+
+    # ── Dashboard stats ──────────────────────────────────────────────────
     @app.route('/api/dashboard-stats', methods=['GET'])
-    def stats():
+    def dashboard_stats():
         try:
             entries = DDEntry.query.all()
-            dept_counts = Counter(e.department or 'Unspecified' for e in entries)
-            priority_counts = Counter(e.priority or 'Unspecified' for e in entries)
+            dept_counts = Counter((e.department or 'Unspecified') for e in entries)
+            priority_counts = Counter((e.priority or 'Unspecified') for e in entries)
             return jsonify({
                 "total_records": len(entries),
-                "dept_labels": list(dept_counts.keys()), "dept_values": list(dept_counts.values()),
-                "priority_labels": list(priority_counts.keys()), "priority_values": list(priority_counts.values())
-            })
+                "dept_labels": list(dept_counts.keys()),
+                "dept_values": list(dept_counts.values()),
+                "priority_labels": list(priority_counts.keys()),
+                "priority_values": list(priority_counts.values()),
+            }), 200
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    # ── Excel export ─────────────────────────────────────────────────────
+    @app.route('/api/entries/excel', methods=['GET'])
+    def download_excel():
+        try:
+            entries = DDEntry.query.order_by(DDEntry.id.desc()).all()
+            wb = Workbook()
+            ws = wb.active
+            ws.title = "D&D Records"
+
+            headers = [
+                'S.No', 'Department', 'Work Type', 'Date', 'Global ID', 'Purpose',
+                'Material', 'Material (Other)', 'Type', 'Type (Other)',
+                'Frequency', 'Quantity', 'Project Name', 'Description',
+                'Priority', 'Item Status', 'Task'
+            ]
+            ws.append(headers)
+
+            for index, e in enumerate(entries, start=1):
+                row = entry_to_dict(e)
+                ws.append([
+                    index, row.get('department', ''), row.get('workType', ''), row.get('date', ''),
+                    row.get('globalId', ''), row.get('purpose', ''), row.get('material', ''),
+                    row.get('otherMaterial', ''), row.get('itemType', ''), row.get('otherType', ''),
+                    row.get('frequency', ''), row.get('quantity', ''), row.get('projectName', ''),
+                    row.get('description', ''), row.get('priority', ''), row.get('status', ''), row.get('task', '')
+                ])
+
+            buffer = io.BytesIO()
+            wb.save(buffer)
+            buffer.seek(0)
+            return send_file(
+                buffer,
+                as_attachment=True,
+                download_name='dd_department_records.xlsx',
+                mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            )
+        except Exception as e:
+            return jsonify({"success": False, "error": str(e)}), 500
+
+    # ── Wipe all records ─────────────────────────────────────────────────
+    @app.route('/api/entries/clear', methods=['DELETE'])
+    def clear_all():
+        try:
+            db.session.query(DDEntry).delete()
+            db.session.commit()
+            return jsonify({"success": True, "message": "Database wiped clean"}), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"success": False, "error": str(e)}), 500
+
     return app
+
 
 app = create_app()
 
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', debug=True, port=5000)
 # this code is working some function is running
 # import os
 # from flask import Flask, request, jsonify
